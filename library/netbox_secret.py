@@ -1,6 +1,7 @@
-#!./netbox/bin/python
+#!/usr/bin/python
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
+
 try:
     import pynetbox
     PYNETBOX_IMPORT = True
@@ -19,7 +20,7 @@ options:
     description:
       - State of an object
       - List will list all secret information for an object
-    choices: [present, absent, list]
+    choices: [present, absent, show]
 
   name:
     required: true
@@ -76,7 +77,8 @@ def run_module():
 
     result = dict(
         changed=False,
-        msg=''
+        msg='',
+        role_created=False
     )
 
     module = AnsibleModule(
@@ -97,21 +99,23 @@ def run_module():
     # Fail if secret_role is not defined
     if state != 'show' and secret_role == None:
         module.fail_json(msg='State is {}. Please define secret_role'.format(state))
-
-    #
+    # Fail if pynetbox is not installed
     if not PYNETBOX_IMPORT:
         module.fail_json(msg='pynetbox is not installed on this system. \
             Please run `pip install pynetbox`')
-
+    # Try to instantiate a netbox connection object
     try:
         nb = pynetbox.api(url, private_key_file=private_key, token=token)
     except Exception as e:
-        module.fail_json(msg='Failed to connect to the netbox instance at {}'.format(url))
+        module.fail_json(msg='Failed to connect to the netbox instance at {}. {}'.format(url,e))
 
+    # Present state
     if state == 'present':
         if secret_role != None:
+            # Get the secret_role object when defined
             secret_role_obj = nb.secrets.secret_roles.get(name=secret_role)
             if secret_role_obj == None:
+                # If object doesn't exist, try to create it
                 try:
                     nb.secrets.secret_roles.create(name=secret_role, slug=secret_role.replace(' ', '-').lower(), users=[''])
                 except pynetbox.lib.query.RequestError as e:
@@ -122,6 +126,7 @@ def run_module():
         # Filter device secrets based on device name
         device_secrets = [ i for i in nb.secrets.secrets.filter(device=device) 
                           if (str(i.role) == secret_role and str(i.name) == name)]
+        # Get device object for secret being manipulated
         device_secret_obj = device_secrets[0] if len(device_secrets) > 0 else None
         if device_secret_obj == None:
             if name != None and device != None and secret != None:
@@ -129,8 +134,7 @@ def run_module():
                 try:
                     device_id = nb.dcim.devices.get(name=device).id
                 except AttributeError as e:
-                    module.fail_json(msg='The device doesn\'t \
-                        exist for the secret you are trying to create')
+                    module.fail_json(msg='The device doesn\'t exist for the secret you are trying to create')
                 role_id = nb.secrets.secret_roles.get(name=secret_role).id
                 # Try to create the secret object
                 try:
@@ -153,7 +157,30 @@ def run_module():
                 result['changed'] = True
                 result['secret_changed'] = True
                 result['msg'] = 'Secret for device {} has been updated'.format(device)
+    # Absent state
+    elif state == 'absent':
+        if name != None and device != None and secret_role != None:
+            # Try to get secret role id, fail if it doesn't exist
+            try:
+                role_id = nb.secrets.secret_roles.get(name=secret_role).id
+            except NoneType:
+                module.fail_json(msg='There is no secret role: {}'.format(secret_role))
+            # Try to get secret object, fail if it doesn't exist
+            try:
+                secret_obj = [i for i in nb.secrets.secrets.filter(device=device, name=name) if i.role.id == role_id][0]
+            except IndexError:
+                module.fail_json(msg='A secret for the defined device and name doesn\'t exist')
+            # Try to delete the secret object
+            if secret_obj.delete():
+                result['changed'] = True
+                result['secret_deleted'] = True
+                result['msg'] = 'Secret \'{}\' for device {} has been deleted'.format(name,secret)
+        else:
+                # Name, device and secret need to be defined
+                module.fail_json(msg='Please define name, device and device_role if trying to delete a secret object')
+    # Show state
     elif state == 'show':
+        # Set empty dictionary
         args = {}
         if name != None:
             args['name'] = name
@@ -161,17 +188,22 @@ def run_module():
             role_id = nb.secrets.secret_roles.get(name=secret_role).id
         if device != None:
             args['device'] = device
+        # Filter using pointer to arguments
         secrets_list = nb.secrets.secrets.filter(**args)
         result['secrets'] = []
         for i in secrets_list:
+            # No secret_role defined
             if secret_role != None:
+                # Only build result list with matching secret role
                 if i.role.id == role_id:
                     result['secrets'].append({'secret_role': i.role.name,'password': i.plaintext, 'name': i.name, 'device': i.device.name})
+            # Build result with matching secrets
             else:
                 result['secrets'].append({'secret_role': i.role.name,'password': i.plaintext, 'name': i.name, 'device': i.device.name})
+        # Fail if length of secret results is 0
         if len(result['secrets']) == 0:
             module.fail_json(msg='No secrets were matched with these parameters')
-
+    # Exit the module
     module.exit_json(**result)
 
 def main():
